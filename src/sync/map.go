@@ -120,19 +120,19 @@ func (m *Map) loadReadOnly() readOnly {
 func (m *Map) Load(key any) (value any, ok bool) {
 	read := m.loadReadOnly()
 	e, ok := read.m[key]
-	if !ok && read.amended {
+	if !ok && read.amended { // NOTE: 如果没有找到，且read.amended为true，则说明dirty中可能存在
 		m.mu.Lock()
 		// Avoid reporting a spurious miss if m.dirty got promoted while we were
 		// blocked on m.mu. (If further loads of the same key will not miss, it's
 		// not worth copying the dirty map for this key.)
 		read = m.loadReadOnly()
 		e, ok = read.m[key]
-		if !ok && read.amended {
+		if !ok && read.amended { // NOTE: 二次检查，在获取锁之前，map的状态是否发生了变化
 			e, ok = m.dirty[key]
 			// Regardless of whether the entry was present, record a miss: this key
 			// will take the slow path until the dirty map is promoted to the read
 			// map.
-			m.missLocked()
+			m.missLocked() // NOTE: 记录miss次数
 		}
 		m.mu.Unlock()
 	}
@@ -152,6 +152,7 @@ func (e *entry) load() (value any, ok bool) {
 
 // Store sets the value for a key.
 func (m *Map) Store(key, value any) {
+	// NOTE: 存储key-value对
 	_, _ = m.Swap(key, value)
 }
 
@@ -316,10 +317,10 @@ func (e *entry) delete() (value any, ok bool) {
 func (e *entry) trySwap(i *any) (*any, bool) {
 	for {
 		p := e.p.Load()
-		if p == expunged {
+		if p == expunged { // NOTE: 如果被标记为expunged，则返回false
 			return nil, false
 		}
-		if e.p.CompareAndSwap(p, i) {
+		if e.p.CompareAndSwap(p, i) { // NOTE: 尝试swap, 可能被其他goroutine修改
 			return p, true
 		}
 	}
@@ -330,18 +331,22 @@ func (e *entry) trySwap(i *any) (*any, bool) {
 func (m *Map) Swap(key, value any) (previous any, loaded bool) {
 	read := m.loadReadOnly()
 	if e, ok := read.m[key]; ok {
+		// NOTE: 如果key存在于read中，则直接尝试swap
 		if v, ok := e.trySwap(&value); ok {
-			if v == nil {
+			if v == nil { // NOTE: p 不为 expunged
 				return nil, false
 			}
 			return *v, true
 		}
 	}
 
+	// NOTE: 走到这里，两种可能
+	// 1. key不存在于read中
+	// 2. key存在于read中，但是被标记为expunged
 	m.mu.Lock()
 	read = m.loadReadOnly()
 	if e, ok := read.m[key]; ok {
-		if e.unexpungeLocked() {
+		if e.unexpungeLocked() { // NOTE: 将 expunged -> nil
 			// The entry was previously expunged, which implies that there is a
 			// non-nil dirty map and this entry is not in it.
 			m.dirty[key] = e
@@ -350,7 +355,7 @@ func (m *Map) Swap(key, value any) (previous any, loaded bool) {
 			loaded = true
 			previous = *v
 		}
-	} else if e, ok := m.dirty[key]; ok {
+	} else if e, ok := m.dirty[key]; ok { // NOTE: key只存在于dirty中
 		if v := e.swapLocked(&value); v != nil {
 			loaded = true
 			previous = *v
@@ -358,9 +363,10 @@ func (m *Map) Swap(key, value any) (previous any, loaded bool) {
 	} else {
 		if !read.amended {
 			// We're adding the first new key to the dirty map.
-			// Make sure it is allocated and mark the read-only map as incomplete.
+			// Make sure it is allocated and mark the read-only map as incomplete. 
+			// NOTE: 在dirty中添加第一个new key
 			m.dirtyLocked()
-			m.read.Store(&readOnly{m: read.m, amended: true})
+			m.read.Store(&readOnly{m: read.m, amended: true}) // NOTE: amended表示dirty中存在read中不存在的key
 		}
 		m.dirty[key] = newEntry(value)
 	}
@@ -482,9 +488,10 @@ func (m *Map) Range(f func(key, value any) bool) {
 
 func (m *Map) missLocked() {
 	m.misses++
-	if m.misses < len(m.dirty) {
+	if m.misses < len(m.dirty) { 		
 		return
 	}
+	// NOTE: miss次数大于等于dirty中的key数量
 	m.read.Store(&readOnly{m: m.dirty})
 	m.dirty = nil
 	m.misses = 0
@@ -497,7 +504,7 @@ func (m *Map) dirtyLocked() {
 
 	read := m.loadReadOnly()
 	m.dirty = make(map[any]*entry, len(read.m))
-	for k, e := range read.m {
+	for k, e := range read.m { // 将read中所有p为nil的都修改为expunged, 将p不为nil的都添加到dirty中
 		if !e.tryExpungeLocked() {
 			m.dirty[k] = e
 		}
